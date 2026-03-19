@@ -1,0 +1,6 @@
+[DB] Database initialized: ./data/multiuser.db
+[WORKSPACE] Base path: /home/node/.openclaw/multiuser-workspaces
+🤖 Multi-tenant Telegram Bot starting...
+📁 Workspace base: /home/node/.openclaw/multiuser-workspaces
+🔗 OpenClaw gateway: http://localhost:18789
+[ERROR] User 6843611560: Request failed with status code 404

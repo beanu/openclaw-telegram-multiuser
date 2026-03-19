@@ -1,0 +1,26 @@
+{
+  "tiers": {
+    "free": {
+      "daily": 10000,
+      "total": 100000
+    },
+    "basic": {
+      "daily": 50000,
+      "total": 500000
+    },
+    "pro": {
+      "daily": 200000,
+      "total": 2000000
+    },
+    "vip": {
+      "daily": 1000000,
+      "total": 10000000
+    }
+  },
+  "adminIds": [],
+  "features": {
+    "allowSignup": true,
+    "requireApproval": false,
+    "enableSkills": true
+  }
+}
