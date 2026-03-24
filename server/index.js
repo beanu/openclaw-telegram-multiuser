@@ -8,36 +8,49 @@
  * - Tracks token usage per user
  */
 
-const { Telegraf, Markup } = require('telegraf');
-const express = require('express');
+const { Telegraf } = require('telegraf');
 const path = require('path');
 const fs = require('fs-extra');
 const Database = require('./database');
 const WorkspaceManager = require('./workspaceManager');
 const TokenQuotaManager = require('./tokenQuotaManager');
 const OpenClawClient = require('./openclawClient');
+const AgentManager = require('./agentManager');
+const StreamHandler = require('./streamHandler');
+const RateLimiter = require('./rateLimiter');
 
 class MultiTenantBot {
   constructor() {
-    // 配置
+    const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL || 'http://localhost:18789';
+    const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || '';
+    const gatewayWsUrl = gatewayUrl.replace(/^http/, 'ws');
+
     this.config = {
       botToken: process.env.BOT_TOKEN,
-      openclawGateway: process.env.OPENCLAW_GATEWAY || 'http://localhost:3000',
-      openclawApiKey: process.env.OPENCLAW_API_KEY,
+      openclawGatewayUrl: gatewayUrl,
+      openclawGatewayToken: gatewayToken,
+      openclawGatewayWsUrl: gatewayWsUrl,
       workspaceBase: process.env.WORKSPACE_BASE || path.join(process.env.HOME || '/root', '.openclaw/multiuser-workspaces'),
       dbPath: process.env.DB_PATH || path.join(__dirname, '..', 'data', 'multiuser.db'),
-      adminIds: (process.env.ADMIN_IDS || '').split(',').filter(Boolean).map(Number)
+      adminIds: (process.env.ADMIN_IDS || '').split(',').filter(Boolean).map(Number),
+      enableStreaming: (process.env.ENABLE_STREAMING || 'true').toLowerCase() !== 'false'
     };
 
-    // 初始化组件 (数据库和配额管理器在 start() 中初始化)
     this.bot = new Telegraf(this.config.botToken);
     this.db = new Database(this.config.dbPath);
     this.workspace = new WorkspaceManager(this.config.workspaceBase);
-    this.quota = null; // 在 initialize 后创建
-    this.openclaw = new OpenClawClient(this.config.openclawGateway, this.config.openclawApiKey);
-
-    // 用户会话缓存
-    this.userSessions = new Map();
+    this.quota = null;
+    this.openclaw = new OpenClawClient({
+      gatewayUrl: this.config.openclawGatewayUrl,
+      gatewayToken: this.config.openclawGatewayToken
+    });
+    this.agentManager = new AgentManager({
+      gatewayWsUrl: this.config.openclawGatewayWsUrl,
+      gatewayToken: this.config.openclawGatewayToken,
+      workspaceBase: '~/.openclaw/workspaces'
+    });
+    this.streamHandler = new StreamHandler();
+    this.rateLimiter = new RateLimiter();
 
     this.setupMiddleware();
     this.setupCommands();
@@ -53,7 +66,6 @@ class MultiTenantBot {
 
       const userId = ctx.from.id;
       
-      // 获取或创建用户
       let user = await this.db.getUser(userId);
       if (!user) {
         user = await this.db.createUser({
@@ -63,21 +75,31 @@ class MultiTenantBot {
           lastName: ctx.from.last_name
         });
 
-        // 创建工作空间
         await this.workspace.create(userId);
-        
-        console.log(`[NEW USER] ${userId} (@${ctx.from.username})`);
+
+        const agentId = `user_${userId}`;
+        try {
+          await this.agentManager.createAgent(agentId);
+        } catch (err) {
+          console.error(`[AGENT] Failed to provision agent for new user ${userId}:`, err.message);
+        }
+        this.db.setAgentId(userId, agentId);
+
+        console.log(`[NEW USER] ${userId} (@${ctx.from.username}) agent=${agentId}`);
       }
 
-      // 更新最后活跃时间
+      if (user && user.is_banned) {
+        return ctx.reply('❌ 你的账号已被封禁，请联系管理员。');
+      }
+
       await this.db.updateUser(userId, { lastActive: new Date().toISOString() });
 
-      // 检查配额
       const quotaInfo = await this.quota.getQuotaInfo(userId);
+      const agentId = user.agent_id || this.db.getAgentId(userId) || `user_${userId}`;
 
-      // 附加到上下文
       ctx.state.user = user;
       ctx.state.quota = quotaInfo;
+      ctx.state.agentId = agentId;
       ctx.state.workspacePath = this.workspace.getPath(userId);
 
       return next();
@@ -227,59 +249,223 @@ class MultiTenantBot {
       );
     });
 
-    // 处理普通消息
-    this.bot.on('message', async (ctx) => {
-      // 跳过非文本消息的简单处理
-      if (!ctx.message.text) {
-        return ctx.reply('⚠️ 暂不支持处理此类型消息，请发送文本。');
+    // /admin_quota - 增加配额
+    this.bot.command('admin_quota', async (ctx) => {
+      if (!this.config.adminIds.includes(ctx.from.id)) {
+        return ctx.reply('❌ 无权限');
       }
 
+      const args = (ctx.message.text || '').split(/\s+/).slice(1);
+      if (args.length < 2) {
+        return ctx.reply('用法: /admin_quota <user_id> <amount>');
+      }
+
+      const targetId = parseInt(args[0], 10);
+      const amount = parseInt(args[1], 10);
+      if (isNaN(targetId) || isNaN(amount) || amount <= 0) {
+        return ctx.reply('❌ 参数无效。user_id 和 amount 必须为正整数。');
+      }
+
+      const targetUser = await this.db.getUser(targetId);
+      if (!targetUser) {
+        return ctx.reply(`❌ 用户 ${targetId} 不存在`);
+      }
+
+      const newQuota = await this.quota.addQuota(targetId, amount);
+      await ctx.reply(
+        `✅ 已为用户 ${targetId} 增加 ${this.formatNumber(amount)} Token 配额\n` +
+        `当前剩余: ${this.formatNumber(newQuota.remaining)}`,
+      );
+    });
+
+    // /admin_ban - 封禁/解封用户
+    this.bot.command('admin_ban', async (ctx) => {
+      if (!this.config.adminIds.includes(ctx.from.id)) {
+        return ctx.reply('❌ 无权限');
+      }
+
+      const args = (ctx.message.text || '').split(/\s+/).slice(1);
+      if (args.length < 1) {
+        return ctx.reply('用法: /admin_ban <user_id>');
+      }
+
+      const targetId = parseInt(args[0], 10);
+      if (isNaN(targetId)) {
+        return ctx.reply('❌ user_id 必须为整数');
+      }
+
+      const targetUser = await this.db.getUser(targetId);
+      if (!targetUser) {
+        return ctx.reply(`❌ 用户 ${targetId} 不存在`);
+      }
+
+      if (targetUser.is_banned) {
+        await this.db.unbanUser(targetId);
+        await ctx.reply(`✅ 用户 ${targetId} 已解封`);
+      } else {
+        await this.db.banUser(targetId);
+        await ctx.reply(`✅ 用户 ${targetId} 已封禁`);
+      }
+    });
+
+    // /admin_info - 查看用户详情
+    this.bot.command('admin_info', async (ctx) => {
+      if (!this.config.adminIds.includes(ctx.from.id)) {
+        return ctx.reply('❌ 无权限');
+      }
+
+      const args = (ctx.message.text || '').split(/\s+/).slice(1);
+      if (args.length < 1) {
+        return ctx.reply('用法: /admin_info <user_id>');
+      }
+
+      const targetId = parseInt(args[0], 10);
+      if (isNaN(targetId)) {
+        return ctx.reply('❌ user_id 必须为整数');
+      }
+
+      const details = await this.db.getUserDetails(targetId);
+      if (!details) {
+        return ctx.reply(`❌ 用户 ${targetId} 不存在`);
+      }
+
+      const { user, quota, recentUsage, installedSkills } = details;
+      const last7days = recentUsage.slice(0, 7);
+      const recentTokens = last7days.reduce((sum, r) => sum + (r.tokens_used || 0), 0);
+
+      await ctx.reply(
+        `👤 *用户详情: ${targetId}*\n\n` +
+        `用户名: @${user.username || '无'}\n` +
+        `姓名: ${user.first_name || ''} ${user.last_name || ''}\n` +
+        `等级: ${user.tier}\n` +
+        `状态: ${user.is_banned ? '🚫 已封禁' : '✅ 正常'}\n` +
+        `注册时间: ${user.created_at}\n` +
+        `最后活跃: ${user.last_active}\n` +
+        `消息数: ${user.message_count}\n\n` +
+        `💰 *配额*\n` +
+        `总量: ${this.formatNumber(quota?.total_quota || 0)}\n` +
+        `已用: ${this.formatNumber(quota?.used_quota || 0)}\n` +
+        `今日: ${this.formatNumber(quota?.daily_used || 0)} / ${this.formatNumber(quota?.daily_limit || 0)}\n\n` +
+        `📊 *近7天 Token*: ${this.formatNumber(recentTokens)}\n` +
+        `🛠️ *技能*: ${installedSkills.length > 0 ? installedSkills.join(', ') : '无'}`,
+        { parse_mode: 'Markdown' }
+      );
+    });
+
+    // 处理普通消息
+    this.bot.on('message', async (ctx) => {
       const userId = ctx.from.id;
       const text = ctx.message.text;
+
+      // 检查是否是安装技能命令（仅文本）
+      if (text && text.toLowerCase().startsWith('install skill ')) {
+        const skillName = text.slice(14).trim();
+        return this.handleSkillInstall(ctx, skillName);
+      }
+
+      // 构建 OpenResponses input
+      const input = await this.buildInput(ctx);
+      if (input === null) {
+        return ctx.reply('⚠️ 暂不支持处理此类型消息，请发送文本、图片或文档。');
+      }
+
+      // 速率限制
+      const rateCheck = this.rateLimiter.canProcess(userId);
+      if (!rateCheck.ok) {
+        return ctx.reply(rateCheck.reason);
+      }
 
       // 检查配额
       if (ctx.state.quota.remaining <= 0) {
         return ctx.reply('❌ 你的 Token 配额已用完，请联系管理员充值。');
       }
 
-      // 检查是否是安装技能命令
-      if (text.toLowerCase().startsWith('install skill ')) {
-        const skillName = text.slice(14).trim();
-        return this.handleSkillInstall(ctx, skillName);
+      // 预请求配额估算
+      const inputLength = typeof input === 'string' ? input.length : JSON.stringify(input).length;
+      const estimatedTokens = Math.ceil(inputLength / 2) + 500;
+      const quotaCheck = await this.quota.hasEnoughQuota(userId, estimatedTokens);
+      if (!quotaCheck.ok) {
+        const remaining = quotaCheck.totalOk ? quotaCheck.dailyRemaining : quotaCheck.remaining;
+        return ctx.reply(
+          `❌ 配额不足\n\n` +
+          `预计需要: ~${this.formatNumber(estimatedTokens)} tokens\n` +
+          `当前剩余: ${this.formatNumber(remaining)} tokens\n\n` +
+          `请联系管理员增加配额。`
+        );
       }
 
-      // 发送"正在处理"提示
-      const processingMsg = await ctx.reply('🤖 正在处理中...');
+      const agentId = ctx.state.agentId;
+      const user = ctx.state.user;
+      const sessionKey = `tg:${userId}:${user.session_count || 0}`;
+      const instructions = await this.getInstructions(userId);
 
-      try {
-        // 发送到 OpenClaw 处理
-        const response = await this.openclaw.chat(userId, text, {
-          workspacePath: ctx.state.workspacePath,
-          user: ctx.state.user
-        });
+      this.rateLimiter.startRequest(userId);
 
-        // 删除处理提示
-        await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
+      if (this.config.enableStreaming) {
+        await ctx.sendChatAction('typing');
 
-        // 记录使用量
-        await this.quota.consumeTokens(userId, response.tokensUsed || 0);
-        await this.db.incrementMessageCount(userId);
+        try {
+          const stream = this.openclaw.chatStream(agentId, sessionKey, input, {
+            instructions
+          });
 
-        // 发送回复
-        if (response.text) {
-          // 长消息分段发送
-          await this.sendLongMessage(ctx, response.text);
+          const { fullText, usage } = await this.streamHandler.handleStream(ctx, stream);
+
+          let tokensUsed = usage?.total_tokens || 0;
+          if (!tokensUsed) {
+            tokensUsed = Math.ceil((inputLength + (fullText || '').length) / 2);
+          }
+          await this.quota.consumeTokens(userId, tokensUsed);
+          await this.db.incrementMessageCount(userId);
+
+          const inputSummary = typeof input === 'string' ? input : (input.find(i => i.text)?.text || '[media]');
+          this.db.recordMessage(userId, 'user', inputSummary, 0, null, sessionKey);
+          this.db.recordMessage(userId, 'assistant', fullText, tokensUsed, 'openclaw', sessionKey);
+
+        } catch (error) {
+          console.error(`[ERROR] User ${userId} (stream):`, error.message);
+          await ctx.reply(
+            `❌ 处理失败: ${error.message}\n\n` +
+            `请稍后重试，如果问题持续请联系管理员。`
+          );
+        } finally {
+          this.rateLimiter.endRequest(userId);
         }
+      } else {
+        const processingMsg = await ctx.reply('🤖 正在处理中...');
 
-      } catch (error) {
-        console.error(`[ERROR] User ${userId}:`, error.message);
-        
-        await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
-        
-        await ctx.reply(
-          `❌ 处理失败: ${error.message}\n\n` +
-          `请稍后重试，如果问题持续请联系管理员。`
-        );
+        try {
+          const response = await this.openclaw.chat(agentId, sessionKey, input, {
+            instructions
+          });
+
+          await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
+
+          let tokensUsed = response.tokensUsed || 0;
+          if (!tokensUsed) {
+            tokensUsed = Math.ceil((inputLength + (response.text || '').length) / 2);
+          }
+          await this.quota.consumeTokens(userId, tokensUsed);
+          await this.db.incrementMessageCount(userId);
+
+          const inputSummary = typeof input === 'string' ? input : (input.find(i => i.text)?.text || '[media]');
+          this.db.recordMessage(userId, 'user', inputSummary, 0, null, sessionKey);
+          this.db.recordMessage(userId, 'assistant', response.text, tokensUsed, response.model, sessionKey);
+
+          if (response.text) {
+            await this.sendLongMessage(ctx, response.text);
+          }
+
+        } catch (error) {
+          console.error(`[ERROR] User ${userId}:`, error.message);
+          await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
+          await ctx.reply(
+            `❌ 处理失败: ${error.message}\n\n` +
+            `请稍后重试，如果问题持续请联系管理员。`
+          );
+        } finally {
+          this.rateLimiter.endRequest(userId);
+        }
       }
     });
   }
@@ -292,11 +478,16 @@ class MultiTenantBot {
       await ctx.answerCbQuery();
       const userId = ctx.from.id;
 
-      // 重置工作空间
       await this.workspace.reset(userId);
       await this.db.clearHistory(userId);
 
-      await ctx.editMessageText('✅ 工作空间已重置完成！');
+      const user = this.db.getUser(userId);
+      const newCount = (user.session_count || 0) + 1;
+      this.db.updateUser(userId, { sessionCount: newCount });
+
+      await ctx.editMessageText(
+        `✅ 工作空间已重置完成！\n会话已刷新 (session #${newCount})`
+      );
     });
 
     // 取消重置
@@ -314,26 +505,104 @@ class MultiTenantBot {
 
   // ==================== 辅助方法 ====================
 
-  async handleSkillInstall(ctx, skillName) {
-    const userId = ctx.from.id;
-    const workspacePath = ctx.state.workspacePath;
+  /**
+   * Convert a Telegram message into an OpenResponses `input` value.
+   * Returns a string for plain text, an array of input items for media,
+   * or null if the message type is unsupported.
+   */
+  async buildInput(ctx) {
+    const msg = ctx.message;
 
-    try {
-      // 调用 OpenClaw 安装技能
-      await this.openclaw.installSkill(userId, skillName, workspacePath);
-      
-      await ctx.reply(`✅ 技能 \`${skillName}\` 安装成功！`, { parse_mode: 'Markdown' });
-    } catch (error) {
-      await ctx.reply(`❌ 技能安装失败: ${error.message}`);
+    if (msg.text) {
+      return msg.text;
     }
+
+    if (msg.photo) {
+      const photo = msg.photo[msg.photo.length - 1];
+      const fileLink = await ctx.telegram.getFileLink(photo.file_id);
+      const items = [
+        { type: 'input_image', image_url: fileLink.href }
+      ];
+      if (msg.caption) {
+        items.push({ type: 'input_text', text: msg.caption });
+      }
+      return items;
+    }
+
+    if (msg.document) {
+      const mime = msg.document.mime_type || '';
+      const supportedMimes = [
+        'text/plain', 'text/markdown', 'text/html', 'text/csv',
+        'application/json', 'application/pdf'
+      ];
+      const isSupported = supportedMimes.includes(mime) || mime.startsWith('image/');
+      if (!isSupported) {
+        return null;
+      }
+
+      const fileLink = await ctx.telegram.getFileLink(msg.document.file_id);
+      const filename = msg.document.file_name || 'file';
+
+      if (mime.startsWith('image/')) {
+        const items = [
+          { type: 'input_image', image_url: fileLink.href }
+        ];
+        if (msg.caption) {
+          items.push({ type: 'input_text', text: msg.caption });
+        }
+        return items;
+      }
+
+      const items = [
+        { type: 'input_file', filename, file_url: fileLink.href }
+      ];
+      if (msg.caption) {
+        items.push({ type: 'input_text', text: msg.caption });
+      }
+      return items;
+    }
+
+    return null;
+  }
+
+  async handleSkillInstall(ctx, skillName) {
+    // Skill installation is now managed by OpenClaw agent workspaces.
+    // This handler is kept as a placeholder for future implementation.
+    await ctx.reply(`⚠️ 技能安装功能正在迁移中，请稍后再试。`);
+  }
+
+  /**
+   * Read SOUL.md and USER.md from the user's local workspace
+   * and return them as combined instructions for the OpenClaw request.
+   */
+  async getInstructions(userId) {
+    const workspacePath = this.workspace.getPath(userId);
+    const parts = [];
+
+    for (const filename of ['SOUL.md', 'USER.md']) {
+      const filePath = path.join(workspacePath, filename);
+      try {
+        const content = await fs.readFile(filePath, 'utf-8');
+        if (content.trim()) {
+          parts.push(content.trim());
+        }
+      } catch {
+        // File doesn't exist yet -- skip
+      }
+    }
+
+    return parts.length > 0 ? parts.join('\n\n---\n\n') : undefined;
   }
 
   async sendLongMessage(ctx, text, maxLength = 4000) {
     if (text.length <= maxLength) {
-      return ctx.reply(text, { parse_mode: 'Markdown' });
+      try {
+        return await ctx.reply(text, { parse_mode: 'Markdown' });
+      } catch (e) {
+        return await ctx.reply(text);
+      }
     }
 
-    // 分段发送
     const parts = [];
     let remaining = text;
     
@@ -343,7 +612,6 @@ class MultiTenantBot {
         break;
       }
 
-      // 找到合适的分割点
       let splitIndex = remaining.lastIndexOf('\n\n', maxLength);
       if (splitIndex === -1 || splitIndex < maxLength / 2) {
         splitIndex = remaining.lastIndexOf('. ', maxLength);
@@ -359,7 +627,11 @@ class MultiTenantBot {
     }
 
     for (const part of parts) {
-      await ctx.reply(part, { parse_mode: 'Markdown' });
+      try {
+        await ctx.reply(part, { parse_mode: 'Markdown' });
+      } catch (e) {
+        await ctx.reply(part);
+      }
     }
   }
 
@@ -383,10 +655,14 @@ class MultiTenantBot {
 
     console.log('🤖 Multi-tenant Telegram Bot starting...');
     console.log(`📁 Workspace base: ${this.config.workspaceBase}`);
-    console.log(`🔗 OpenClaw gateway: ${this.config.openclawGateway}`);
+    console.log(`🔗 OpenClaw gateway: ${this.config.openclawGatewayUrl}`);
+    console.log(`📡 Streaming: ${this.config.enableStreaming ? 'enabled' : 'disabled'}`);
 
     // 启动 bot (这个会阻塞，保持长轮询)
     await this.bot.launch();
+
+    process.once('SIGINT', () => this.bot.stop('SIGINT'));
+    process.once('SIGTERM', () => this.bot.stop('SIGTERM'));
   }
 }
 

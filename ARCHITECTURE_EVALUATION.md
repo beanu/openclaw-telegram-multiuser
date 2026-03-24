@@ -452,4 +452,4 @@ openclaw gateway call config.patch --params '{
 2. **搭建 SaaS 后端骨架，接收 Webhook**
 3. **实现基础消息转发链路：Telegram → 后端 → OpenClaw → 后端 → Telegram**
 4. **在此基础上逐步添加计费/鉴权/风控/流式传输等业务层**
-5. **根据租户规模选择策略 A（共享 Agent）或策略 B（独立 Agent）**
+5. **选择策略 B（独立 Agent）**

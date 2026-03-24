@@ -104,6 +104,22 @@ class DatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_message_history_user ON message_history(telegram_id);
       CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at);
     `);
+
+    // Migration: add agent_id column if missing
+    try {
+      this.db.exec(`ALTER TABLE users ADD COLUMN agent_id TEXT`);
+    } catch (e) {
+      // Column already exists -- safe to ignore
+    }
+
+    // Migration: add model and session_key columns to message_history if missing
+    for (const col of ['model TEXT', 'session_key TEXT']) {
+      try {
+        this.db.exec(`ALTER TABLE message_history ADD COLUMN ${col}`);
+      } catch (e) {
+        // Column already exists
+      }
+    }
   }
 
   // ==================== 用户操作 ====================
@@ -157,8 +173,6 @@ class DatabaseManager {
     
     if (fields.length === 0) return;
     
-    fields.push("last_active = datetime('now')");
-    
     const stmt = this.db.prepare(`
       UPDATE users SET ${fields.join(', ')}
       WHERE telegram_id = ?
@@ -172,6 +186,27 @@ class DatabaseManager {
       UPDATE users SET message_count = message_count + 1
       WHERE telegram_id = ?
     `).run(telegramId);
+  }
+
+  setAgentId(telegramId, agentId) {
+    this.db.prepare(`
+      UPDATE users SET agent_id = ? WHERE telegram_id = ?
+    `).run(agentId, telegramId);
+  }
+
+  getAgentId(telegramId) {
+    const row = this.db.prepare(`
+      SELECT agent_id FROM users WHERE telegram_id = ?
+    `).get(telegramId);
+    return row?.agent_id || null;
+  }
+
+  recordMessage(telegramId, role, content, tokensUsed = 0, model = null, sessionKey = null) {
+    const truncated = content && content.length > 500 ? content.slice(0, 500) : (content || '');
+    this.db.prepare(`
+      INSERT INTO message_history (telegram_id, role, content, tokens_used, model, session_key)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(telegramId, role, truncated, tokensUsed, model, sessionKey);
   }
 
   clearHistory(telegramId) {
@@ -352,6 +387,7 @@ class DatabaseManager {
    * 获取使用统计
    */
   getUsageStats(telegramId, days = 30) {
+    const safeDays = parseInt(days, 10) || 30;
     return this.db.prepare(`
       SELECT 
         date,
@@ -362,9 +398,9 @@ class DatabaseManager {
           ELSE 0
         END as avg_tokens_per_message
       FROM token_usage
-      WHERE telegram_id = ? AND date >= date('now', '-${days} days')
+      WHERE telegram_id = ? AND date >= date('now', '-' || ? || ' days')
       ORDER BY date DESC
-    `).all(telegramId);
+    `).all(telegramId, safeDays);
   }
 }
 

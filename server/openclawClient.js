@@ -1,220 +1,188 @@
 /**
  * OpenClaw Client
- * 
- * 与 OpenClaw Gateway JSON-RPC API 交互
+ *
+ * Communicates with OpenClaw Gateway via the OpenResponses API (POST /v1/responses).
+ * Each request is routed to a specific agent/session using HTTP headers.
  */
 
 const axios = require('axios');
 
 class OpenClawClient {
-  constructor(gatewayUrl, apiKey) {
-    this.gatewayUrl = gatewayUrl || 'http://localhost:18789';
-    this.apiKey = apiKey;
-    this.requestId = 0;
-    
+  constructor(config) {
+    this.gatewayUrl = config.gatewayUrl;
+    this.gatewayToken = config.gatewayToken;
+
     this.client = axios.create({
       baseURL: this.gatewayUrl,
       headers: {
         'Content-Type': 'application/json',
-        ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {})
+        ...(this.gatewayToken ? { 'Authorization': `Bearer ${this.gatewayToken}` } : {})
       },
-      timeout: 120000 // 2分钟超时
+      timeout: 120000
     });
   }
 
   /**
-   * 发送 JSON-RPC 请求
+   * Send a message to a specific OpenClaw agent and return the assistant reply.
+   *
+   * @param {string} agentId   - OpenClaw agent id (e.g. "user_123456")
+   * @param {string} sessionKey - Session scope within the agent (e.g. "tg:123456")
+   * @param {string} input     - User message text
+   * @param {object} [options]
+   * @param {string} [options.instructions] - System-level instructions (SOUL.md + USER.md)
+   * @param {number} [options.maxOutputTokens] - Limit output length
+   * @returns {{ text: string, tokensUsed: number, model: string }}
    */
-  async rpc(method, params = {}) {
-    const id = ++this.requestId;
-    
-    const response = await this.client.post('/', {
-      jsonrpc: '2.0',
-      id,
-      method,
-      params
-    });
+  async chat(agentId, sessionKey, input, options = {}) {
+    const body = {
+      model: 'openclaw',
+      input,
+      stream: false,
+      user: sessionKey
+    };
 
-    if (response.data.error) {
-      throw new Error(response.data.error.message || 'RPC error');
+    if (options.instructions) {
+      body.instructions = options.instructions;
+    }
+    if (options.maxOutputTokens) {
+      body.max_output_tokens = options.maxOutputTokens;
     }
 
-    return response.data.result;
+    const headers = {
+      'x-openclaw-agent-id': agentId,
+      'x-openclaw-session-key': sessionKey
+    };
+
+    const response = await this.client.post('/v1/responses', body, { headers });
+    const data = response.data;
+
+    const text = this._extractText(data);
+    const tokensUsed = data.usage?.total_tokens || 0;
+    const model = data.model || 'openclaw';
+
+    return { text, tokensUsed, model };
   }
 
   /**
-   * 发送消息到 OpenClaw 处理
+   * Extract assistant reply text from the OpenResponses output array.
    */
-  async chat(userId, message, options = {}) {
-    const sessionKey = this.getSessionKey(userId);
-    
-    try {
-      // 调用 OpenClaw agent JSON-RPC API
-      const result = await this.rpc('agent', {
-        message,
-        sessionKey,
-        wait: true,  // 等待响应
-        // 其他选项
-        stream: false,
-        timeout: 60000,
-        ...options
-      });
+  _extractText(data) {
+    if (!data.output || !Array.isArray(data.output)) {
+      return '(无响应)';
+    }
 
-      // 解析响应
-      // agent 方法返回的是终端快照或响应
-      let responseText = '';
-      let tokensUsed = 0;
-      
-      if (result) {
-        // 尝试从不同格式中提取响应文本
-        if (typeof result === 'string') {
-          responseText = result;
-        } else if (result.text) {
-          responseText = result.text;
-        } else if (result.response) {
-          responseText = result.response;
-        } else if (result.terminal) {
-          responseText = result.terminal;
-        } else if (result.output) {
-          responseText = result.output;
-        } else {
-          // 尝试序列化整个结果
-          responseText = JSON.stringify(result);
+    const parts = [];
+    for (const item of data.output) {
+      if (item.type === 'message' && Array.isArray(item.content)) {
+        for (const block of item.content) {
+          if (block.type === 'output_text' && block.text) {
+            parts.push(block.text);
+          }
         }
-        
-        // 提取 token 使用量
-        tokensUsed = result.usage?.totalTokens || 
-                     result.tokensUsed || 
-                     Math.ceil(message.length / 4) + Math.ceil(responseText.length / 4);
       }
+    }
 
-      return {
-        text: responseText || '(无响应)',
-        tokensUsed,
-        sessionId: sessionKey,
-        model: result?.model || 'openclaw'
-      };
+    return parts.join('\n') || '(无响应)';
+  }
 
-    } catch (error) {
-      // 如果 Gateway API 不可用，使用模拟响应
-      if (error.code === 'ECONNREFUSED' || 
-          error.code === 'ENOTFOUND' ||
-          error.message?.includes('connect') ||
-          error.message?.includes('timeout')) {
-        console.log('[OpenClaw] Gateway not available:', error.message);
-        return this.mockChat(userId, message);
+  /**
+   * Stream a message to a specific OpenClaw agent via SSE.
+   * Yields parsed SSE event objects: { type, data }.
+   *
+   * @param {string} agentId
+   * @param {string} sessionKey
+   * @param {string} input
+   * @param {object} [options]
+   * @param {string} [options.instructions]
+   * @param {number} [options.maxOutputTokens]
+   * @yields {{ type: string, data: object }}
+   */
+  async *chatStream(agentId, sessionKey, input, options = {}) {
+    const body = {
+      model: 'openclaw',
+      input,
+      stream: true,
+      user: sessionKey
+    };
+
+    if (options.instructions) {
+      body.instructions = options.instructions;
+    }
+    if (options.maxOutputTokens) {
+      body.max_output_tokens = options.maxOutputTokens;
+    }
+
+    const headers = {
+      'x-openclaw-agent-id': agentId,
+      'x-openclaw-session-key': sessionKey
+    };
+
+    const response = await this.client.post('/v1/responses', body, {
+      headers,
+      responseType: 'stream',
+      timeout: 0
+    });
+
+    for await (const event of this._parseSSE(response.data)) {
+      yield event;
+    }
+  }
+
+  /**
+   * Parse an SSE byte stream into structured event objects.
+   * Handles the standard SSE wire format: event/data lines separated by blank lines.
+   */
+  async *_parseSSE(stream) {
+    let buffer = '';
+
+    for await (const chunk of stream) {
+      buffer += chunk.toString();
+
+      let boundaryIndex;
+      while ((boundaryIndex = buffer.indexOf('\n\n')) !== -1) {
+        const block = buffer.slice(0, boundaryIndex);
+        buffer = buffer.slice(boundaryIndex + 2);
+
+        let eventType = 'message';
+        let dataLines = [];
+
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event:')) {
+            eventType = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
+            const raw = line.slice(5).trim();
+            if (raw === '[DONE]') return;
+            dataLines.push(raw);
+          }
+        }
+
+        if (dataLines.length === 0) continue;
+
+        const joined = dataLines.join('\n');
+        try {
+          yield { type: eventType, data: JSON.parse(joined) };
+        } catch {
+          yield { type: eventType, data: joined };
+        }
       }
-      throw error;
     }
   }
 
   /**
-   * 获取会话历史
+   * Quick connectivity check against the Gateway.
    */
-  async getHistory(userId, limit = 50) {
-    const sessionKey = this.getSessionKey(userId);
-    
+  async healthCheck() {
     try {
-      const result = await this.rpc('sessions.history', {
-        sessionKey,
-        limit
-      });
-      
-      return result?.messages || [];
-    } catch (error) {
-      console.error('[OpenClaw] Failed to get history:', error.message);
-      return [];
-    }
-  }
+      const response = await this.client.post('/v1/responses', {
+        model: 'openclaw',
+        input: 'ping',
+        stream: false
+      }, { timeout: 10000 });
 
-  /**
-   * 清除会话
-   */
-  async clearSession(userId) {
-    const sessionKey = this.getSessionKey(userId);
-    
-    try {
-      await this.rpc('sessions.reset', { sessionKey });
-      return true;
-    } catch (error) {
-      console.error('[OpenClaw] Failed to clear session:', error.message);
-      return false;
-    }
-  }
-
-  /**
-   * 安装技能
-   */
-  async installSkill(userId, skillName, workspacePath) {
-    try {
-      const result = await this.rpc('skills.install', {
-        skill: skillName,
-        workspace: workspacePath
-      });
-      
-      return result;
-    } catch (error) {
-      // 模拟安装成功
-      console.log(`[OpenClaw] Skill install mock: ${skillName}`);
-      return { success: true, skill: skillName };
-    }
-  }
-
-  /**
-   * 获取技能列表
-   */
-  async listSkills(workspacePath) {
-    try {
-      const result = await this.rpc('skills.list', {
-        workspace: workspacePath
-      });
-      
-      return result?.skills || [];
-    } catch (error) {
-      return [];
-    }
-  }
-
-  /**
-   * 获取 Gateway 状态
-   */
-  async getStatus() {
-    try {
-      const result = await this.rpc('health');
-      return { status: 'ok', ...result };
+      return { status: 'ok', model: response.data?.model };
     } catch (error) {
       return { status: 'unavailable', error: error.message };
     }
-  }
-
-  /**
-   * 生成会话 key
-   */
-  getSessionKey(userId) {
-    // 使用 telegram:user_id 格式
-    return `telegram:${userId}`;
-  }
-
-  /**
-   * 模拟聊天响应（Gateway 不可用时）
-   */
-  async mockChat(userId, message) {
-    // 简单的模拟响应
-    const responses = [
-      `收到你的消息: "${message}"\n\n⚠️ 这是模拟响应，因为 OpenClaw Gateway 未连接。`,
-      `我收到了: ${message}\n\n请配置 OpenClaw Gateway 以获得完整功能。`,
-      `消息已接收。\n\n当前运行在模拟模式。请启动 OpenClaw Gateway 以启用 AI 功能。`
-    ];
-
-    // 估算 token 使用量
-    const tokensUsed = Math.ceil(message.length / 4) + 100;
-
-    return {
-      text: responses[Math.floor(Math.random() * responses.length)],
-      tokensUsed,
-      sessionId: `mock_${userId}`,
-      model: 'mock'
-    };
   }
 }
 
