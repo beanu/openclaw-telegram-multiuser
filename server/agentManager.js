@@ -1,8 +1,11 @@
 /**
  * Agent Manager
  *
- * Manages OpenClaw agent lifecycle (Strategy B: per-tenant independent agents)
- * by shelling out to the `openclaw` CLI with remote Gateway credentials.
+ * Manages OpenClaw agent lifecycle (per-tenant independent agents)
+ * by shelling out to the `openclaw` CLI.
+ *
+ * The CLI operates on the local config (~/.openclaw/openclaw.json).
+ * Gateway URL/token are configured there, not passed per-command.
  */
 
 const { execFile } = require('child_process');
@@ -14,23 +17,19 @@ const EXEC_TIMEOUT = 30000;
 
 class AgentManager {
   constructor(config) {
-    this.gatewayWsUrl = config.gatewayWsUrl;
-    this.gatewayToken = config.gatewayToken;
     this.workspaceBase = config.workspaceBase || '~/.openclaw/multiuser-workspaces';
   }
 
   /**
-   * Create a new agent on the remote Gateway.
-   * Workspace is created at WORKSPACE_BASE/user_<agentId> by `openclaw agents add`.
+   * Create a new agent via `openclaw agents add`.
+   * Workspace is created at WORKSPACE_BASE/user_<agentId>.
    * Idempotent: returns true even if the agent already exists.
    */
   async createAgent(agentId) {
     const workspacePath = `${this.workspaceBase}/user_${agentId}`;
     const args = [
       'agents', 'add', agentId,
-      '--workspace', workspacePath,
-      '--url', this.gatewayWsUrl,
-      '--token', this.gatewayToken
+      '--workspace', workspacePath
     ];
 
     try {
@@ -49,14 +48,10 @@ class AgentManager {
   }
 
   /**
-   * Delete an agent from the remote Gateway.
+   * Delete an agent via `openclaw agents delete`.
    */
   async deleteAgent(agentId) {
-    const args = [
-      'agents', 'delete', agentId,
-      '--url', this.gatewayWsUrl,
-      '--token', this.gatewayToken
-    ];
+    const args = ['agents', 'delete', agentId];
 
     try {
       const { stdout } = await execFileAsync('openclaw', args, { timeout: EXEC_TIMEOUT });
@@ -69,21 +64,17 @@ class AgentManager {
   }
 
   /**
-   * List all agents on the remote Gateway.
+   * List all agents via `openclaw agents list`.
    */
   async listAgents() {
-    const args = [
-      'agents', 'list', '--json',
-      '--url', this.gatewayWsUrl,
-      '--token', this.gatewayToken
-    ];
+    const args = ['agents', 'list'];
 
     try {
       const { stdout } = await execFileAsync('openclaw', args, { timeout: EXEC_TIMEOUT });
-      return JSON.parse(stdout);
+      return stdout.trim();
     } catch (error) {
       console.error('[AGENT] Failed to list agents:', error.stderr || error.message);
-      return [];
+      return '';
     }
   }
 }

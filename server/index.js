@@ -22,13 +22,11 @@ class MultiTenantBot {
   constructor() {
     const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL || 'http://localhost:18789';
     const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || '';
-    const gatewayWsUrl = gatewayUrl.replace(/^http/, 'ws');
 
     this.config = {
       botToken: process.env.BOT_TOKEN,
       openclawGatewayUrl: gatewayUrl,
       openclawGatewayToken: gatewayToken,
-      openclawGatewayWsUrl: gatewayWsUrl,
       workspaceBase: process.env.WORKSPACE_BASE || path.join(process.env.HOME || '/root', '.openclaw/multiuser-workspaces'),
       dbPath: process.env.DB_PATH || path.join(__dirname, '..', 'data', 'multiuser.db'),
       adminIds: (process.env.ADMIN_IDS || '').split(',').filter(Boolean).map(Number),
@@ -44,8 +42,6 @@ class MultiTenantBot {
       gatewayToken: this.config.openclawGatewayToken
     });
     this.agentManager = new AgentManager({
-      gatewayWsUrl: this.config.openclawGatewayWsUrl,
-      gatewayToken: this.config.openclawGatewayToken,
       workspaceBase: this.config.workspaceBase
     });
     this.streamHandler = new StreamHandler();
