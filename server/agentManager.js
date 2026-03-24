@@ -22,11 +22,11 @@ class AgentManager {
 
   /**
    * Create a new agent via `openclaw agents add`.
-   * Workspace is created at WORKSPACE_BASE/user_<agentId>.
+   * Workspace is created at WORKSPACE_BASE/<agentId>.
    * Idempotent: returns true even if the agent already exists.
    */
   async createAgent(agentId) {
-    const workspacePath = `${this.workspaceBase}/user_${agentId}`;
+    const workspacePath = `${this.workspaceBase}/${agentId}`;
     const args = [
       'agents', 'add', agentId,
       '--workspace', workspacePath

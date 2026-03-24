@@ -38,7 +38,7 @@ class OpenClawClient {
       model: `openclaw:${agentId}`,
       input,
       stream: false,
-      user: sessionKey
+      user: agentId
     };
 
     if (options.instructions) {
@@ -107,7 +107,7 @@ class OpenClawClient {
       model: `openclaw:${agentId}`,
       input,
       stream: true,
-      user: sessionKey
+      user: agentId
     };
 
     if (options.instructions) {
