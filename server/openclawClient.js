@@ -53,8 +53,13 @@ class OpenClawClient {
       'x-openclaw-session-key': sessionKey
     };
 
+    console.log(`[API] --> chat agent=${agentId} session=${sessionKey}`);
+    console.log(`[API] --> body: ${JSON.stringify(body)}`);
+
     const response = await this.client.post('/v1/responses', body, { headers });
     const data = response.data;
+
+    console.log(`[API] <-- status=${response.status} body: ${JSON.stringify(data)}`);
 
     const text = this._extractText(data);
     const tokensUsed = data.usage?.total_tokens || 0;
@@ -117,13 +122,19 @@ class OpenClawClient {
       'x-openclaw-session-key': sessionKey
     };
 
+    console.log(`[API] --> chatStream agent=${agentId} session=${sessionKey}`);
+    console.log(`[API] --> body: ${JSON.stringify(body)}`);
+
     const response = await this.client.post('/v1/responses', body, {
       headers,
       responseType: 'stream',
       timeout: 0
     });
 
+    console.log(`[API] <-- stream started status=${response.status}`);
+
     for await (const event of this._parseSSE(response.data)) {
+      console.log(`[API] <-- event type=${event.type} data: ${JSON.stringify(event.data)}`);
       yield event;
     }
   }
