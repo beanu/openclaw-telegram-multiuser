@@ -35,7 +35,7 @@ class OpenClawClient {
    */
   async chat(agentId, sessionKey, input, options = {}) {
     const body = {
-      model: 'openclaw',
+      model: `openclaw:${agentId}`,
       input,
       stream: false,
       user: sessionKey
@@ -104,7 +104,7 @@ class OpenClawClient {
    */
   async *chatStream(agentId, sessionKey, input, options = {}) {
     const body = {
-      model: 'openclaw',
+      model: `openclaw:${agentId}`,
       input,
       stream: true,
       user: sessionKey
