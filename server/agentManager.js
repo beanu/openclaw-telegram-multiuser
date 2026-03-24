@@ -16,15 +16,16 @@ class AgentManager {
   constructor(config) {
     this.gatewayWsUrl = config.gatewayWsUrl;
     this.gatewayToken = config.gatewayToken;
-    this.workspaceBase = config.workspaceBase || '~/.openclaw/workspaces';
+    this.workspaceBase = config.workspaceBase || '~/.openclaw/multiuser-workspaces';
   }
 
   /**
    * Create a new agent on the remote Gateway.
+   * Workspace is created at WORKSPACE_BASE/user_<agentId> by `openclaw agents add`.
    * Idempotent: returns true even if the agent already exists.
    */
   async createAgent(agentId) {
-    const workspacePath = `${this.workspaceBase}/${agentId}`;
+    const workspacePath = `${this.workspaceBase}/user_${agentId}`;
     const args = [
       'agents', 'add', agentId,
       '--workspace', workspacePath,

@@ -8,7 +8,11 @@
 
 const path = require('path');
 const readline = require('readline');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 require('dotenv').config();
+
+const execFileAsync = promisify(execFile);
 
 const Database = require('../server/database');
 const TokenQuotaManager = require('../server/tokenQuotaManager');
@@ -45,6 +49,7 @@ async function main() {
     console.log('5. 封禁/解封用户');
     console.log('6. 查看全局统计');
     console.log('7. 重置用户数据');
+    console.log('8. 删除用户');
     console.log('0. 退出');
 
     const choice = await prompt('\n选择操作: ');
@@ -70,6 +75,9 @@ async function main() {
         break;
       case '7':
         await resetUser();
+        break;
+      case '8':
+        await deleteUser();
         break;
       case '0':
         console.log('👋 再见！');
@@ -184,6 +192,39 @@ async function resetUser() {
   await workspace.reset(parseInt(userId));
   db.clearHistory(parseInt(userId));
   console.log('✅ 用户数据已重置');
+}
+
+async function deleteUser() {
+  const userId = await prompt('输入用户 ID: ');
+  const id = parseInt(userId);
+  const user = db.getUser(id);
+
+  if (!user) {
+    console.log('❌ 用户不存在');
+    return;
+  }
+
+  console.log(`\n⚠️  即将删除用户: ${user.username || 'N/A'} (ID: ${id})`);
+  console.log('此操作将永久删除该用户的所有数据（数据库记录 + 工作空间 + OpenClaw Agent），不可恢复！');
+  const confirm = await prompt('确认删除? 请输入 "DELETE" 确认: ');
+
+  if (confirm !== 'DELETE') {
+    console.log('❌ 已取消');
+    return;
+  }
+
+  const agentId = user.agent_id || `user_${id}`;
+
+  try {
+    await execFileAsync('openclaw', ['agents', 'delete', agentId], { timeout: 15000 });
+    console.log(`  ✓ OpenClaw Agent "${agentId}" 已删除`);
+  } catch (e) {
+    console.log(`  ⚠ OpenClaw Agent "${agentId}" 删除失败 (可能不存在): ${e.message}`);
+  }
+
+  await workspace.delete(id);
+  db.deleteUser(id);
+  console.log('✅ 用户已彻底删除');
 }
 
 main().catch(err => {

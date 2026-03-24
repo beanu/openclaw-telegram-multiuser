@@ -11,19 +11,19 @@ class TokenQuotaManager {
     // 配额等级配置
     this.tiers = {
       free: {
-        daily: 10000,      // 每日 10K
+        daily: 100000,      // 每日 100K
         total: 100000      // 总量 100K
       },
       basic: {
-        daily: 50000,      // 每日 50K
+        daily: 500000,      // 每日 500K
         total: 500000      // 总量 500K
       },
       pro: {
-        daily: 200000,     // 每日 200K
+        daily: 2000000,     // 每日 2M
         total: 2000000     // 总量 2M
       },
       vip: {
-        daily: 1000000,    // 每日 1M
+        daily: 10000000,    // 每日 10M
         total: 10000000    // 总量 10M
       },
       unlimited: {

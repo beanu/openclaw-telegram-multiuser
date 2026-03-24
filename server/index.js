@@ -10,7 +10,6 @@
 
 const { Telegraf } = require('telegraf');
 const path = require('path');
-const fs = require('fs-extra');
 const Database = require('./database');
 const WorkspaceManager = require('./workspaceManager');
 const TokenQuotaManager = require('./tokenQuotaManager');
@@ -47,7 +46,7 @@ class MultiTenantBot {
     this.agentManager = new AgentManager({
       gatewayWsUrl: this.config.openclawGatewayWsUrl,
       gatewayToken: this.config.openclawGatewayToken,
-      workspaceBase: '~/.openclaw/workspaces'
+      workspaceBase: this.config.workspaceBase
     });
     this.streamHandler = new StreamHandler();
     this.rateLimiter = new RateLimiter();
@@ -74,8 +73,6 @@ class MultiTenantBot {
           firstName: ctx.from.first_name,
           lastName: ctx.from.last_name
         });
-
-        await this.workspace.create(userId);
 
         const agentId = `user_${userId}`;
         try {
@@ -397,7 +394,6 @@ class MultiTenantBot {
       const agentId = ctx.state.agentId;
       const user = ctx.state.user;
       const sessionKey = `tg:${userId}:${user.session_count || 0}`;
-      const instructions = await this.getInstructions(userId);
 
       this.rateLimiter.startRequest(userId);
 
@@ -405,9 +401,7 @@ class MultiTenantBot {
         await ctx.sendChatAction('typing');
 
         try {
-          const stream = this.openclaw.chatStream(agentId, sessionKey, input, {
-            instructions
-          });
+          const stream = this.openclaw.chatStream(agentId, sessionKey, input);
 
           const { fullText, usage } = await this.streamHandler.handleStream(ctx, stream);
 
@@ -435,9 +429,7 @@ class MultiTenantBot {
         const processingMsg = await ctx.reply('🤖 正在处理中...');
 
         try {
-          const response = await this.openclaw.chat(agentId, sessionKey, input, {
-            instructions
-          });
+          const response = await this.openclaw.chat(agentId, sessionKey, input);
 
           await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
 
@@ -569,29 +561,6 @@ class MultiTenantBot {
     // Skill installation is now managed by OpenClaw agent workspaces.
     // This handler is kept as a placeholder for future implementation.
     await ctx.reply(`⚠️ 技能安装功能正在迁移中，请稍后再试。`);
-  }
-
-  /**
-   * Read SOUL.md and USER.md from the user's local workspace
-   * and return them as combined instructions for the OpenClaw request.
-   */
-  async getInstructions(userId) {
-    const workspacePath = this.workspace.getPath(userId);
-    const parts = [];
-
-    for (const filename of ['SOUL.md', 'USER.md']) {
-      const filePath = path.join(workspacePath, filename);
-      try {
-        const content = await fs.readFile(filePath, 'utf-8');
-        if (content.trim()) {
-          parts.push(content.trim());
-        }
-      } catch {
-        // File doesn't exist yet -- skip
-      }
-    }
-
-    return parts.length > 0 ? parts.join('\n\n---\n\n') : undefined;
   }
 
   async sendLongMessage(ctx, text, maxLength = 4000) {

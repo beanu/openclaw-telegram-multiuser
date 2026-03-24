@@ -226,6 +226,17 @@ class DatabaseManager {
     this.db.prepare(`UPDATE users SET is_banned = 0 WHERE telegram_id = ?`).run(telegramId);
   }
 
+  deleteUser(telegramId) {
+    const del = this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM installed_skills WHERE telegram_id = ?`).run(telegramId);
+      this.db.prepare(`DELETE FROM message_history WHERE telegram_id = ?`).run(telegramId);
+      this.db.prepare(`DELETE FROM token_usage WHERE telegram_id = ?`).run(telegramId);
+      this.db.prepare(`DELETE FROM quotas WHERE telegram_id = ?`).run(telegramId);
+      this.db.prepare(`DELETE FROM users WHERE telegram_id = ?`).run(telegramId);
+    });
+    del();
+  }
+
   // ==================== Token 使用 ====================
 
   recordTokenUsage(telegramId, tokens) {
