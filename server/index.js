@@ -389,7 +389,7 @@ class MultiTenantBot {
 
       const agentId = ctx.state.agentId;
       const user = ctx.state.user;
-      const sessionKey = `tg:${userId}:${user.session_count || 0}`;
+      const sessionKey = `agent:${agentId}:${user.session_count || 0}`;
 
       this.rateLimiter.startRequest(userId);
 
